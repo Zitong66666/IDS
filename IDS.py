@@ -1,9 +1,17 @@
 import pandas as pd
-import os
-import netCDF4
-from popy1 import popy,datetime2datenum,datedev_py,Level3_Data, Level3_List  # Replace with your actual module and class names
+import os,sys,glob
+import logging
+from netCDF4 import Dataset
+try:
+    from popy import (popy,
+                      datetime2datenum,
+                      F_center2edge,
+                      datedev_py,
+                      Level3_Data, 
+                      Level3_List)
+except:
+    logging.error('clone https://github.com/Kang-Sun-CfA/Oversampling_matlab.git and add to your path!')
 import datetime as dt
-import zipfile, requests, os, sys, glob
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -16,42 +24,13 @@ from scipy.ndimage import percentile_filter
 from scipy.interpolate import RegularGridInterpolator
 from scipy.stats import kendalltau
 from astropy.convolution import convolve_fft
-from netCDF4 import Dataset
 import statsmodels.formula.api as smf
-import logging
 from shapely.ops import unary_union
-from test_nei import Inventory
 import shapely
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.axes import Axes
 from cartopy.mpl.geoaxes import GeoAxes
-
-# Identify the L3 data NetCDF files
-# l3_files = []
-# dt_array = pd.period_range(start='2019-09-22',end='2019-09-30',freq='1D')
-# for ip,p in enumerate(dt_array):
-#     l3_fn = p.strftime(l3_path_pattern)
-#     if os.path.exists(l3_fn):
-#         l3_files.append(l3_fn)
-#     else:
-#         continue
-
-# # Instantiate the Level3_List object
-# level3_list = Level3_List(dt_array=dt_array,west=-128,east=-65,south=24,north=50) # CONUS
-# level3_list.read_nc_pattern(l3_path_pattern=l3_path_pattern)
-def F_center2edge(lon,lat):
-    '''
-    function to shut up complain of pcolormesh like 
-    MatplotlibDeprecationWarning: shading='flat' when X and Y have the same dimensions as C is deprecated since 3.3.
-    create grid edges from grid centers
-    '''
-    res=np.mean(np.diff(lon))
-    lonr = np.append(lon-res/2,lon[-1]+res/2)
-    res=np.mean(np.diff(lat))
-    latr = np.append(lat-res/2,lat[-1]+res/2)
-    return lonr,latr
-
 
 
 class Agri_region():
