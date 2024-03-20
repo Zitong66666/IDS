@@ -32,6 +32,129 @@ import cartopy.feature as cfeature
 from matplotlib.axes import Axes
 from cartopy.mpl.geoaxes import GeoAxes
 
+class Inventory(dict):
+    '''class based on dict, representing a gridded emission inventory'''
+    def __init__(self,name=None,west=-180,east=180,south=-90,north=90):
+        self.logger = logging.getLogger(__name__)
+        self.name = name
+        self.west = west
+        self.east = east
+        self.south = south
+        self.north = north
+    
+    def download_NEI_ag(self,nei_dir):
+        '''download nei ag from http://geoschemdata.wustl.edu/ExtData/HEMCO/NEI2016/v2021-06/
+        to dir
+        '''
+        cwd = os.getcwd()
+        os.chdir(nei_dir)
+        for imonth in range(1,13):
+            url = 'http://geoschemdata.wustl.edu/ExtData/HEMCO/NEI2016/v2021-06/'
+            murl = '{}/2016fh_16j_ag_0pt1degree_month_{:02d}.ncf'.format(url,imonth)
+            self.logger.info(f'downloading {murl}')
+            os.system('wget -N {}'.format(murl))
+        os.chdir(cwd)
+    
+    def read_NEI_ag(self,monthly_filenames,field='NH3',unit='nmol/m2/s'):
+        '''read a list of monthly NEI inventory files
+        monthly_filenames:
+            a list of file paths
+        field:
+            data field to read from the nc file
+        unit:
+            emission will be converted from kg/m2/s (double check) to this unit
+        '''
+        mons = []
+        for i,filename in enumerate(monthly_filenames):
+            nc = Dataset(filename)
+            if i == 0:
+                monthly_fields = np.zeros((nc.dimensions['lat'].size,
+                                           nc.dimensions['lon'].size,
+                                           len(monthly_filenames)))
+                xgrid = nc['lon'][:].data
+                ygrid = nc['lat'][:].data
+                xgrid_size = np.abs(np.nanmedian(np.diff(xgrid)))
+                ygrid_size = np.abs(np.nanmedian(np.diff(ygrid)))
+                self.xgrid_size = xgrid_size
+                self.ygrid_size = ygrid_size
+                if not np.isclose(xgrid_size,ygrid_size,rtol=1e-03):
+                    self.logger.warning(f'x grid size {xgrid_size} does not equal to y grid size {ygrid_size}')
+                self.grid_size = (xgrid_size+ygrid_size)/2
+                xmask = (xgrid >= self.west) & (xgrid <= self.east)
+                ymask = (ygrid >= self.south) & (ygrid <= self.north)
+                self['xgrid'] = xgrid[xmask]
+                self['ygrid'] = ygrid[ymask]
+                xmesh,ymesh = np.meshgrid(self['xgrid'],self['ygrid'])
+                self['grid_size_in_m2'] = np.cos(np.deg2rad(ymesh/180*np.pi))*np.square(self.grid_size*111e3)
+                nc_unit = nc[field].units
+                if nc_unit == 'kg/m2/s' and unit=='nmol/m2/s' and field in ['NH3','NH3_FERT']:
+                    self.logger.warning(f'unit of {field} will be converted from {nc_unit} to {unit}')
+                    self[f'{field} unit'] = unit
+                    unit_factor = 1e9/0.017
+                else:
+                    self.logger.info('no unit conversion is done')
+                    self[f'{field} unit'] = nc_unit
+                    unit_factor = 1.
+            monthly_fields[:,:,i] = unit_factor*nc[field][:].filled(np.nan)[0,0,:,:]# time and lev are singular dimensions
+            mons.append(dt.datetime(int(str(nc.SDATE)[0:4]),1,1)+dt.timedelta(days=-1+int(str(nc.SDATE)[-3:])))
+            nc.close()
+        self[field] = monthly_fields
+        self['mons'] = pd.to_datetime(mons).to_period('1M')
+        self['sum_NH3'] = np.sum(monthly_fields, axis=2) # zitong add: sum for 12 months
+            
+        return self
+    
+    def plot_all_months(self,field='NH3',nrow=1,ncol=1,figsize=(10,5),**kwargs):
+        fig,axs = plt.subplots(nrow,ncol,figsize=figsize,constrained_layout=True,
+                               subplot_kw={"projection": ccrs.PlateCarree()})
+        if not hasattr(axs, '__iter__'):
+            axs=[axs]
+        for i,ax in enumerate(axs):
+            pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self[field][...,i],**kwargs)
+            ax.coastlines(resolution='50m', color='black', linewidth=1)
+            ax.add_feature(cfeature.STATES.with_scale('50m'), facecolor='None',
+                           edgecolor='black', linewidth=1)
+            ax.set_title(self['mons'][i].strftime('%Y%m'))
+            fig.colorbar(pc,ax=ax,label=self[f'{field} unit'])
+            plt.savefig('5.png')
+    
+    def plot_sum_months(self,field='sum_NH3',nrow=1,ncol=1,figsize=(10,5),**kwargs):
+        # zitong add
+        fig,ax = plt.subplots(nrow,ncol,figsize=figsize,constrained_layout=True,
+                               subplot_kw={"projection": ccrs.PlateCarree()})
+        pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self[field],**kwargs)
+        ax.coastlines(resolution='50m', color='black', linewidth=1)
+        ax.add_feature(cfeature.STATES.with_scale('50m'), facecolor='None',
+                        edgecolor='black', linewidth=1)
+        ax.set_title(field)
+        fig.colorbar(pc,ax=ax,label='nmol/m2/s')
+        plt.savefig('6.png')
+
+    def create_mask_from_sum_NH3(self, minNH3th):
+        # zitong add: make the square boundary of mask E~0
+        sumNH3 = self['sum_NH3']
+        sumNH3 = sumNH3[sumNH3>0]
+        print(np.percentile(sumNH3, minNH3th))
+        mask = np.logical_and(self['sum_NH3']<np.percentile(sumNH3, minNH3th), self['sum_NH3']>0)    
+        print('wow')
+        print(np.sum(mask==True))    
+        xyz = []
+        for i in range(mask.shape[1]):
+            for j in range(mask.shape[0]):
+                if mask[j,i]:
+                    # Calculate the bottom left corner of the square
+                    bottom_left_lon = self['xgrid'][i] - self.xgrid_size / 2
+                    bottom_left_lat = self['ygrid'][j] - self.ygrid_size / 2
+                    # Define square boundaries (bottom_left, bottom_right, top_right, top_left)
+                    square_boundaries = [
+                        (bottom_left_lon, bottom_left_lat),
+                        (bottom_left_lon + self.xgrid_size, bottom_left_lat),
+                        (bottom_left_lon + self.xgrid_size, bottom_left_lat + self.ygrid_size),
+                        (bottom_left_lon, bottom_left_lat + self.ygrid_size)
+                    ]
+                    xyz.append(square_boundaries)
+        self['boundary_mask'] = xyz
+
 
 class Agri_region():
     '''class for Level4 data (NH3 emission) calculated from Level3 data'''
@@ -268,75 +391,3 @@ class Agri_region():
         self.topo_mask = topo_mask
         self.region_mask = region_mask
 
-
-# make the mask E~=0
-# shp_file = "/projects/bbkc/zitong/Data/tl_2019_us_county/tl_2019_us_state.shp"
-# gdf = gpd.read_file(shp_file)
-# excel_file = "/projects/bbkc/zitong/Data/county_ammonia_2020.xlsx"
-# df = pd.read_excel(excel_file)
-# merged_gdf = gdf.merge(df, left_on='NAME', right_on='County')
-# extracted_polygons = merged_gdf[merged_gdf['Emission2020'] <= 400]
-# mask_polygon = unary_union(extracted_polygons.geometry)        
-your_path = '/projects/bbkc/zitong/Data/NEI_gridded'
-monthly_filenames = [os.path.join(your_path,f) for f in os.listdir(your_path) if os.path.isfile(os.path.join(your_path, f))]
-nei = Inventory().read_NEI_ag(monthly_filenames)
-nei.create_mask_from_sum_NH3(minNH3th = 50)
-
-
-# NH3_emission
-l3_path_pattern= '/projects/bbkc/zitong/Data/IASINH3L3_flux02/CONUS_%Y_%m_%d.nc'  # flux004：flux_grid_size=0.04
-region_shp_file = "/projects/bbkc/zitong/Data/tl_2019_us_county/tl_2019_us_state.shp" ## process_by_region
-agri_region = Agri_region(geometry=nei['boundary_mask'],start_dt=dt.datetime(2019,9,23),end_dt=dt.datetime(2021,10,14),west=-128,east=-65,south=24,north=50)#, region_num = 7
-topo_kw = {'resample_rule': '1M'}
-chem_kw = {'resample_rule': '1M'}
-agri_region.process_by_region(l3_path_pattern,topo_kw=topo_kw,chem_kw=chem_kw,
-                  region_shpfilename = region_shp_file, region_num = 6)
-print(agri_region.topo_scale_heights)
-print(agri_region.chem_lifetimes)
-# l3.plot(plot_field='wind_column_topo_chem',saving_path='temp1.png')
-
-# Plot scale height and lifetime
-months = pd.period_range(start='2019-09', end='2021-10', freq='M')
-timestamps = months.to_timestamp()
-fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(10, 5))
-axes[0].plot(timestamps,agri_region.l3ms.df['topo_scale_height']) 
-axes[0].set_ylabel('Scale height (m)')
-axes[1].plot(timestamps,agri_region.l3ms.df['chem_lifetime'])
-axes[1].set_ylabel('Lifetime (h)')
-plt.tight_layout()
-plt.show()
-# plt.savefig('Xtao_region6.png')
-
-# Spatial plot
-df = agri_region.l3ds_df
-filtered_df = df[df['date'] == '2020-04-01']
-# plot monthly total emission of year 2020
-months = pd.period_range(start='2020-01', end='2020-12', freq='M')
-for month in months:    
-    t = df[df['month']==str(month)]
-    arrays = t['wind_column_topo_chem'].values[0:len(t['wind_column_topo_chem'])]
-    list = arrays.tolist()
-    t1 = np.nansum(list, axis=0)
-    t1 = np.where(t1 == 0, np.nan, t1)
-
-    # matrix = filtered_df['wind_column_topo_chem'].values[0]
-    xgrid = filtered_df['xgrid'].iloc[0]
-    ygrid = filtered_df['ygrid'].iloc[0]
-    kwargs = {}
-    kwargs['cmap'] = 'jet'
-    kwargs['alpha'] = 1.
-    kwargs['shrink'] = 0.75
-    kwargs['vmin'] = np.nanmin(t1)
-    kwargs['vmax'] = 3 #np.nanmax(t1)
-    
-    fig,ax = plt.subplots(1,1,figsize=(10,5),subplot_kw={"projection": ccrs.PlateCarree()})
-    ax.set_extent([min(filtered_df['xgrid'].iloc[0]), max(filtered_df['xgrid'].iloc[0]), min(filtered_df['ygrid'].iloc[0]), max(filtered_df['ygrid'].iloc[0])], ccrs.Geodetic())
-    ax.coastlines(resolution='50m', color='black', linewidth=1)
-    ax.add_feature(cfeature.BORDERS.with_scale('50m'))
-    ax.add_feature(cfeature.STATES.with_scale('50m'),edgecolor='k',linewidth=1)
-    pc = ax.pcolormesh(*F_center2edge(xgrid,ygrid),t1,transform=ccrs.PlateCarree(),
-                               alpha=kwargs['alpha'],cmap=kwargs['cmap'],vmin=kwargs['vmin'],vmax=kwargs['vmax'])
-    cb = plt.colorbar(pc,ax=ax,label='wind_column_topo_chem',shrink=kwargs['shrink'])
-
-    # plt.savefig()
-    
