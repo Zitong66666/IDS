@@ -44,7 +44,7 @@ class Inventory(dict):
     
     def download_NEI_ag(self,nei_dir):
         '''download nei ag from http://geoschemdata.wustl.edu/ExtData/HEMCO/NEI2016/v2021-06/
-        to dir
+        to nei_dir
         '''
         cwd = os.getcwd()
         os.chdir(nei_dir)
@@ -55,15 +55,19 @@ class Inventory(dict):
             os.system('wget -N {}'.format(murl))
         os.chdir(cwd)
     
-    def read_NEI_ag(self,monthly_filenames,field='NH3',unit='nmol/m2/s'):
+    def read_NEI_ag(self,monthly_filenames=None,nei_dir=None,field='NH3',unit='mol/m2/s'):
         '''read a list of monthly NEI inventory files
         monthly_filenames:
             a list of file paths
+        nei_dir:
+            if provided, supersedes monthly_filenames
         field:
             data field to read from the nc file
         unit:
             emission will be converted from kg/m2/s (double check) to this unit
         '''
+        monthly_filenames = monthly_filenames or\
+            glob.glob(os.path.join(nei_dir,'2016fh_16j_ag_0pt1degree_month_*.ncf'))
         mons = []
         for i,filename in enumerate(monthly_filenames):
             nc = Dataset(filename)
@@ -84,6 +88,10 @@ class Inventory(dict):
                 ymask = (ygrid >= self.south) & (ygrid <= self.north)
                 self['xgrid'] = xgrid[xmask]
                 self['ygrid'] = ygrid[ymask]
+                self.west = self['xgrid'].min()-self.grid_size
+                self.east = self['xgrid'].max()+self.grid_size
+                self.south = self['ygrid'].min()-self.grid_size
+                self.north = self['ygrid'].max()+self.grid_size
                 xmesh,ymesh = np.meshgrid(self['xgrid'],self['ygrid'])
                 self['grid_size_in_m2'] = np.cos(np.deg2rad(ymesh/180*np.pi))*np.square(self.grid_size*111e3)
                 nc_unit = nc[field].units
@@ -91,6 +99,10 @@ class Inventory(dict):
                     self.logger.warning(f'unit of {field} will be converted from {nc_unit} to {unit}')
                     self[f'{field} unit'] = unit
                     unit_factor = 1e9/0.017
+                elif nc_unit == 'kg/m2/s' and unit=='mol/m2/s' and field in ['NH3','NH3_FERT']:
+                    self.logger.warning(f'unit of {field} will be converted from {nc_unit} to {unit}')
+                    self[f'{field} unit'] = unit
+                    unit_factor = 1/0.017
                 else:
                     self.logger.info('no unit conversion is done')
                     self[f'{field} unit'] = nc_unit
@@ -100,60 +112,108 @@ class Inventory(dict):
             nc.close()
         self[field] = monthly_fields
         self['mons'] = pd.to_datetime(mons).to_period('1M')
-        self['sum_NH3'] = np.sum(monthly_fields, axis=2) # zitong add: sum for 12 months
+        self['data'] = np.mean(monthly_fields, axis=2) # mean emission over months, named "data" to match basin_emissions.py
             
         return self
     
-    def plot_all_months(self,field='NH3',nrow=1,ncol=1,figsize=(10,5),**kwargs):
-        fig,axs = plt.subplots(nrow,ncol,figsize=figsize,constrained_layout=True,
-                               subplot_kw={"projection": ccrs.PlateCarree()})
-        if not hasattr(axs, '__iter__'):
-            axs=[axs]
-        for i,ax in enumerate(axs):
-            pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self[field][...,i],**kwargs)
-            ax.coastlines(resolution='50m', color='black', linewidth=1)
-            ax.add_feature(cfeature.STATES.with_scale('50m'), facecolor='None',
-                           edgecolor='black', linewidth=1)
-            ax.set_title(self['mons'][i].strftime('%Y%m'))
-            fig.colorbar(pc,ax=ax,label=self[f'{field} unit'])
-            plt.savefig('5.png')
+    def regrid(self,l3,fields_to_copy=None,method=None):
+        '''regrid inventory to match the mesh of a l3 data object
+        fields_to_copy:
+            list of fields to copy from l3 to the output Inventory object
+        method:
+            if none, choose from drop_in_the_box and interpolate based on the relative grid size of inventory and l3
+        '''
+        
+        if fields_to_copy is None:
+            fields_to_copy = ['column_amount','wind_topo','surface_altitude']
+        if method is None:
+            if self.grid_size < l3.grid_size/2:
+                method = 'drop_in_the_box'
+#             elif (self.grid_size >= l3.grid_size/2) and (self.grid_size < l3.grid_size*2):
+#                 method = 'tessellate'
+            else:
+                method = 'interpolate'
+            self.logger.warning(f'regridding from {self.grid_size} to {l3.grid_size} using {method}')
+        
+        inv = Inventory()
+        inv['xgrid'] = l3['xgrid']
+        inv['ygrid'] = l3['ygrid']
+        ymesh,xmesh = np.meshgrid(inv['ygrid'],inv['xgrid'])
+        inv.grid_size = l3.grid_size
+        inv.west = inv['xgrid'].min()-inv.grid_size
+        inv.east = inv['xgrid'].max()+inv.grid_size
+        inv.south = inv['ygrid'].min()-inv.grid_size
+        inv.north = inv['ygrid'].max()+inv.grid_size
+        if method in ['interpolate']:
+            f = RegularGridInterpolator((self['ygrid'],self['xgrid']),self['data'],bounds_error=False)
+            inv['data'] = f((ymesh,xmesh)).T
+        elif method in ['drop_in_the_box']:
+            data = np.full((len(inv['ygrid']),len(inv['xgrid'])),np.nan)
+            for iy,y in enumerate(inv['ygrid']):
+                ymask = (self['ygrid']>=y-inv.grid_size/2) & (self['ygrid']<y+inv.grid_size/2)
+                for ix,x in enumerate(inv['xgrid']):
+                    xmask = (self['xgrid']>=x-inv.grid_size/2) & (self['xgrid']<x+inv.grid_size/2)
+                    if np.sum(ymask) == 0 and np.sum(xmask) == 0:
+                        continue
+                    data[iy,ix] = np.nanmean(self['data'][np.ix_(ymask,xmask)])
+            inv['data'] = data
+        for field in fields_to_copy:
+            if field in l3.keys():
+                inv[field] = l3[field].copy()
+            else:
+                self.logger.warning(f'{field} does not exist in l3!')
+        return inv
     
-    def plot_sum_months(self,field='sum_NH3',nrow=1,ncol=1,figsize=(10,5),**kwargs):
-        # zitong add
-        fig,ax = plt.subplots(nrow,ncol,figsize=figsize,constrained_layout=True,
-                               subplot_kw={"projection": ccrs.PlateCarree()})
-        pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self[field],**kwargs)
+    def get_mask(self,max_emission=1e-9,include_nan=True,
+                 min_wind_topo=None,max_wind_topo=None,
+                 min_surface_altitude=None,max_surface_altitude=None,
+                 min_column_amount=None,max_column_amount=None):
+        '''get a mask based on self['data']. pixels lower than max_emission will be True.
+        nan will alse be True if include_nan
+        '''
+        mask = self['data'] <= max_emission
+        if include_nan:
+            mask = mask | np.isnan(self['data'])
+        if min_wind_topo is not None:
+            wt = np.abs(self['wind_topo']/self['column_amount'])
+            mask = mask & (wt >= min_wind_topo)
+        if max_wind_topo is not None:
+            wt = np.abs(self['wind_topo']/self['column_amount'])
+            mask = mask & (wt <= max_wind_topo)
+        if min_surface_altitude is not None:
+            mask = mask & (self['surface_altitude'] > min_surface_altitude)
+        if max_surface_altitude is not None:
+            mask = mask & (self['surface_altitude'] <= max_surface_altitude)
+        if min_column_amount is not None:
+            mask = mask & (self['column_amount'] > min_column_amount)
+        if max_column_amount is not None:
+            mask = mask & (self['column_amount'] <= max_column_amount)
+        return mask
+    
+    def plot(self,ax=None,scale='log',**kwargs):
+        if ax is None:
+            fig,ax = plt.subplots(1,1,figsize=(10,5),subplot_kw={"projection": ccrs.PlateCarree()})
+        else:
+            fig = plt.gcf()
+        if scale == 'log':
+            from matplotlib.colors import LogNorm
+            if 'vmin' in kwargs:
+                inputNorm = LogNorm(vmin=kwargs['vmin'],vmax=kwargs['vmax'])
+                kwargs.pop('vmin');
+                kwargs.pop('vmax');
+            else:
+                inputNorm = LogNorm()
+            pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self['data'],norm=inputNorm,
+                                         **kwargs)
+        else:
+            pc = ax.pcolormesh(*F_center2edge(self['xgrid'],self['ygrid']),self['data'],**kwargs)
+        ax.set_extent([self.west,self.east,self.south,self.north])
         ax.coastlines(resolution='50m', color='black', linewidth=1)
         ax.add_feature(cfeature.STATES.with_scale('50m'), facecolor='None',
-                        edgecolor='black', linewidth=1)
-        ax.set_title(field)
-        fig.colorbar(pc,ax=ax,label='nmol/m2/s')
-        plt.savefig('6.png')
-
-    def create_mask_from_sum_NH3(self, minNH3th):
-        # zitong add: make the square boundary of mask E~0
-        sumNH3 = self['sum_NH3']
-        sumNH3 = sumNH3[sumNH3>0]
-        print(np.percentile(sumNH3, minNH3th))
-        mask = np.logical_and(self['sum_NH3']<np.percentile(sumNH3, minNH3th), self['sum_NH3']>0)    
-        print('wow')
-        print(np.sum(mask==True))    
-        xyz = []
-        for i in range(mask.shape[1]):
-            for j in range(mask.shape[0]):
-                if mask[j,i]:
-                    # Calculate the bottom left corner of the square
-                    bottom_left_lon = self['xgrid'][i] - self.xgrid_size / 2
-                    bottom_left_lat = self['ygrid'][j] - self.ygrid_size / 2
-                    # Define square boundaries (bottom_left, bottom_right, top_right, top_left)
-                    square_boundaries = [
-                        (bottom_left_lon, bottom_left_lat),
-                        (bottom_left_lon + self.xgrid_size, bottom_left_lat),
-                        (bottom_left_lon + self.xgrid_size, bottom_left_lat + self.ygrid_size),
-                        (bottom_left_lon, bottom_left_lat + self.ygrid_size)
-                    ]
-                    xyz.append(square_boundaries)
-        self['boundary_mask'] = xyz
+                       edgecolor='black', linewidth=1)
+        cb = fig.colorbar(pc,ax=ax)
+        figout = {'fig':fig,'pc':pc,'ax':ax,'cb':cb}
+        return figout
 
 
 class Agri_region():
@@ -167,11 +227,9 @@ class Agri_region():
             datetime objects accurate to the day
         west, east, south, north:
             boundary of the region
-        region_shpfilename:
-            filename of regions shp
         '''
         self.logger = logging.getLogger(__name__)
-        self.start_dt = start_dt or dt.datetime(2018,5,1)
+        self.start_dt = start_dt or dt.datetime(2008,1,1)
         self.end_dt = end_dt or dt.datetime.now()
         if geometry is None and xys is not None:
             geometry = xys
@@ -202,7 +260,49 @@ class Agri_region():
             self.south = south
             self.north = north
             self.xys = [([west,west,east,east],[south,north,north,south])]     
-
+    
+    def get_region_emission(self,dt_array=None,l3_path_pattern=None,l3s=None,
+                            masking_kw=None,
+                            fit_topo_kw=None,fit_chem_kw=None):
+        '''handle ammonia emission for the region
+        dt_array:
+            if provided, loads l3s from files. if none, assume daily within start/end_dt
+        l3_path_pattern:
+            if provided, loads l3s from files
+        l3s:
+            if l3_path_pattern not available, has to use provided l3s
+        masking_kw:
+            kw args to handle masking. may include
+                nei_dir: directory of nei ag data
+                monthly_filenames: a list of monthly nei ag files
+        fit_topo/chem_kw:
+            kw args for topo/chem fitting
+        '''
+        if l3_path_pattern is not None:
+            if dt_array is None:
+                dt_array = pd.period_range(self.start_dt,self.end_dt,freq='1D')
+            if_exist = np.array([os.path.exists(d.strftime(l3_path_pattern)) for d in dt_array])
+            if np.sum(if_exist) < len(dt_array):
+                self.logger.warning(
+                    '{} l3 files exist for the {} periods'.format(
+                        np.sum(if_exist),len(dt_array)))
+                dt_array = dt_array.delete(np.arange(len(dt_array))[~if_exist])
+            l3s = Level3_List(dt_array,west=self.west,east=self.east,
+                              south=self.south,north=self.north)
+            l3s.read_nc_pattern(l3_path_pattern=l3_path_pattern,
+                                fields_name=['column_amount','wind_column',
+                                             'num_samples','wind_topo','surface_altitude'])
+        else:
+            l3s = l3s.trim(west=self.west,east=self.east,south=self.south,north=self.north)
+        self.l3all = l3s.aggregate()
+        # handle masks
+        nei_dir = masking_kw.pop('nei_dir',None)
+        monthly_filenames = masking_kw.pop('monthly_filenames',None)
+        nei = Inventory().read_NEI_ag(monthly_filenames=monthly_filenames,
+                                      nei_dir=nei_dir
+                                      ).regrid(self.l3all)
+        topo_mask = nei.get_mask(max_emission=1e-9)
+        
     def process_by_region(self,l3_path_pattern,topo_kw=None,chem_kw=None,
                  region_shpfilename=None, region_num=None):
         
