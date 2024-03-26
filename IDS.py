@@ -165,7 +165,7 @@ class Inventory(dict):
         return inv
     
     def get_mask(self,max_emission=1e-9,include_nan=True,
-                 min_wind_topo=None,max_wind_topo=None,
+                 min_windtopo=None,max_windtopo=None,
                  min_surface_altitude=None,max_surface_altitude=None,
                  min_column_amount=None,max_column_amount=None):
         '''get a mask based on self['data']. pixels lower than max_emission will be True.
@@ -174,12 +174,12 @@ class Inventory(dict):
         mask = self['data'] <= max_emission
         if include_nan:
             mask = mask | np.isnan(self['data'])
-        if min_wind_topo is not None:
+        if min_windtopo is not None:
             wt = np.abs(self['wind_topo']/self['column_amount'])
-            mask = mask & (wt >= min_wind_topo)
-        if max_wind_topo is not None:
+            mask = mask & (wt >= min_windtopo)
+        if max_windtopo is not None:
             wt = np.abs(self['wind_topo']/self['column_amount'])
-            mask = mask & (wt <= max_wind_topo)
+            mask = mask & (wt <= max_windtopo)
         if min_surface_altitude is not None:
             mask = mask & (self['surface_altitude'] > min_surface_altitude)
         if max_surface_altitude is not None:
@@ -295,14 +295,58 @@ class Agri_region():
         else:
             l3s = l3s.trim(west=self.west,east=self.east,south=self.south,north=self.north)
         self.l3all = l3s.aggregate()
+        # make sure default kws are all empty dict
+        masking_kw = masking_kw or {}
+        fit_topo_kw = fit_topo_kw or {}
+        fit_chem_kw = fit_chem_kw or {}
         # handle masks
         nei_dir = masking_kw.pop('nei_dir',None)
         monthly_filenames = masking_kw.pop('monthly_filenames',None)
-        nei = Inventory().read_NEI_ag(monthly_filenames=monthly_filenames,
-                                      nei_dir=nei_dir
-                                      ).regrid(self.l3all)
-        topo_mask = nei.get_mask(max_emission=1e-9)
-        
+        max_topo_emission = masking_kw.pop('max_topo_emission',1e-9)
+        max_chem_emission = masking_kw.pop('max_chem_emission',max_topo_emission)
+        max_topo_windtopo = masking_kw.pop('max_topo_windtopo',np.inf)
+        min_topo_windtopo = masking_kw.pop('min_topo_windtopo',-np.inf)
+        max_chem_windtopo = masking_kw.pop('max_chem_windtopo',np.inf)
+        min_chem_windtopo = masking_kw.pop('min_chem_windtopo',-np.inf)
+        max_topo_column_amount = masking_kw.pop('max_topo_column_amount',np.inf)
+        min_topo_column_amount = masking_kw.pop('min_topo_column_amount',-np.inf)
+        max_chem_column_amount = masking_kw.pop('max_chem_column_amount',np.inf)
+        min_chem_column_amount = masking_kw.pop('min_chem_column_amount',-np.inf)
+        if nei_dir is None and monthly_filenames is None:
+            self.logger.warning('no info provided about inventory, skipping')
+            topo_mask = np.ones(self.l3all['num_samples'].shape,dtype=bool)
+            chem_mask = np.ones(self.l3all['num_samples'].shape,dtype=bool)
+        else:
+            nei = Inventory().read_NEI_ag(
+                monthly_filenames=monthly_filenames,
+                nei_dir=nei_dir,unit='mol/m2/s'
+                ).regrid(
+                    self.l3all,
+                    fields_to_copy=['column_amount',
+                                    'wind_topo','surface_altitude'])
+            topo_mask = nei.get_mask(max_emission=max_topo_emission,
+                                     min_windtopo=min_topo_windtopo,
+                                     max_windtopo=max_topo_windtopo,
+                                     min_column_amount=min_topo_column_amount,
+                                     max_column_amount=max_topo_column_amount)
+            chem_mask = nei.get_mask(max_emission=max_chem_emission,
+                                     min_windtopo=min_chem_windtopo,
+                                     max_windtopo=max_chem_windtopo,
+                                     min_column_amount=min_chem_column_amount,
+                                     max_column_amount=max_chem_column_amount)
+        if 'mask' in fit_topo_kw.keys():
+            topo_mask = topo_mask & fit_topo_kw['mask']
+        if 'mask' in fit_chem_kw.keys():
+            chem_mask = chem_mask & fit_chem_kw['mask']
+        fit_topo_kw.update(dict(mask=topo_mask))
+        fit_chem_kw.update(dict(mask=chem_mask))
+        self.topo_mask = topo_mask
+        self.chem_mask = chem_mask
+        l3s.fit_topography(**fit_topo_kw)
+        l3s.fit_chemistry(**fit_chem_kw)
+        self.l3s = l3s
+        self.l3all = l3s.aggregate()
+    
     def process_by_region(self,l3_path_pattern,topo_kw=None,chem_kw=None,
                  region_shpfilename=None, region_num=None):
         
