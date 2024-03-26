@@ -34,7 +34,7 @@ from cartopy.mpl.geoaxes import GeoAxes
 
 class Inventory(dict):
     '''class based on dict, representing a gridded emission inventory'''
-    def __init__(self,name=None,west=-180,east=180,south=-90,north=90):
+    def __init__(self,name='inventory',west=-180,east=180,south=-90,north=90):
         self.logger = logging.getLogger(__name__)
         self.name = name
         self.west = west
@@ -47,6 +47,9 @@ class Inventory(dict):
         to nei_dir
         '''
         cwd = os.getcwd()
+        if not os.path.exists(nei_dir):
+            self.logger.warning(f'making dir {nei_dir}')
+            os.makedirs(nei_dir)
         os.chdir(nei_dir)
         for imonth in range(1,13):
             url = 'http://geoschemdata.wustl.edu/ExtData/HEMCO/NEI2016/v2021-06/'
@@ -135,7 +138,7 @@ class Inventory(dict):
                 method = 'interpolate'
             self.logger.warning(f'regridding from {self.grid_size} to {l3.grid_size} using {method}')
         
-        inv = Inventory()
+        inv = Inventory(name=self.name)
         inv['xgrid'] = l3['xgrid']
         inv['ygrid'] = l3['ygrid']
         ymesh,xmesh = np.meshgrid(inv['ygrid'],inv['xgrid'])
@@ -215,8 +218,8 @@ class Inventory(dict):
         figout = {'fig':fig,'pc':pc,'ax':ax,'cb':cb}
         return figout
 
-
-class Agri_region():
+# class naming convention: https://pep8.org/#class-names
+class AgriRegion():
     '''class for Level4 data (NH3 emission) calculated from Level3 data'''
     def __init__(self,geometry=None,xys=None,start_dt=None,end_dt=None,
                  west=None,east=None,south=None,north=None):
@@ -270,11 +273,15 @@ class Agri_region():
         l3_path_pattern:
             if provided, loads l3s from files
         l3s:
-            if l3_path_pattern not available, has to use provided l3s
+            if l3_path_pattern not available, have to use provided l3s
         masking_kw:
             kw args to handle masking. may include
-                nei_dir: directory of nei ag data
+                nei_dir: directory of nei ag data, or
                 monthly_filenames: a list of monthly nei ag files
+                max_topo_emission: inventory emission threshold for topo fit,in mol/m2/s
+                max_topo_emission: inventory emission threshold for chem fit
+                {min,max}_{topo,chem}_{windtopo,column_amount}: min/max bounds for
+                windtopo and column_amount in the aggregated l3 for topo or chem fits
         fit_topo/chem_kw:
             kw args for topo/chem fitting
         '''
@@ -316,20 +323,24 @@ class Agri_region():
             self.logger.warning('no info provided about inventory, skipping')
             topo_mask = np.ones(self.l3all['num_samples'].shape,dtype=bool)
             chem_mask = np.ones(self.l3all['num_samples'].shape,dtype=bool)
+            inventory_data = np.zeros(self.l3all['num_samples'].shape,dtype=bool)
         else:
-            nei = Inventory().read_NEI_ag(
+            inv = Inventory(name='NEI',
+                ).read_NEI_ag(
                 monthly_filenames=monthly_filenames,
                 nei_dir=nei_dir,unit='mol/m2/s'
                 ).regrid(
                     self.l3all,
                     fields_to_copy=['column_amount',
-                                    'wind_topo','surface_altitude'])
-            topo_mask = nei.get_mask(max_emission=max_topo_emission,
+                                    'wind_topo','surface_altitude']
+                    )
+            inventory_data = inv['data']
+            topo_mask = inv.get_mask(max_emission=max_topo_emission,
                                      min_windtopo=min_topo_windtopo,
                                      max_windtopo=max_topo_windtopo,
                                      min_column_amount=min_topo_column_amount,
                                      max_column_amount=max_topo_column_amount)
-            chem_mask = nei.get_mask(max_emission=max_chem_emission,
+            chem_mask = inv.get_mask(max_emission=max_chem_emission,
                                      min_windtopo=min_chem_windtopo,
                                      max_windtopo=max_chem_windtopo,
                                      min_column_amount=min_chem_column_amount,
@@ -340,12 +351,14 @@ class Agri_region():
             chem_mask = chem_mask & fit_chem_kw['mask']
         fit_topo_kw.update(dict(mask=topo_mask))
         fit_chem_kw.update(dict(mask=chem_mask))
-        self.topo_mask = topo_mask
-        self.chem_mask = chem_mask
         l3s.fit_topography(**fit_topo_kw)
         l3s.fit_chemistry(**fit_chem_kw)
         self.l3s = l3s
         self.l3all = l3s.aggregate()
+        # store masks and inventory data to l3all for easy plotting
+        self.l3all['topo_mask'] = topo_mask
+        self.l3all['chem_mask'] = chem_mask
+        self.l3all[inv.name] = inventory_data
     
     def process_by_region(self,l3_path_pattern,topo_kw=None,chem_kw=None,
                  region_shpfilename=None, region_num=None):
