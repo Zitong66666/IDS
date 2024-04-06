@@ -119,6 +119,43 @@ class Inventory(dict):
             
         return self
     
+    def read_regrid_landmask(self,l3,landmask_dir=None,field='CONUS_mask'): # zitong add
+        '''
+        read and regrid land mask to match the mesh of a l3 data object
+        landmask -- 1:land, 0:water/background
+        '''
+        nc = Dataset(landmask_dir)
+        xgrid = nc['lon'][:].data
+        ygrid = nc['lat'][:].data
+        xgrid_size = np.abs(np.nanmedian(np.diff(xgrid)))
+        ygrid_size = np.abs(np.nanmedian(np.diff(ygrid)))
+        grid_size = (xgrid_size+ygrid_size)/2
+        ymesh,xmesh = np.meshgrid(l3['ygrid'],l3['xgrid'])
+
+        if grid_size < l3.grid_size/2:
+            method = 'drop_in_the_box'
+        else:
+            method = 'interpolate'
+
+        if method in ['interpolate']:
+            f = RegularGridInterpolator((nc['lat'][:].data,nc['lon'][:].data),np.squeeze(nc[field][:]),method='nearest',bounds_error=False)
+            landmask = f((ymesh,xmesh)).T
+        elif method in ['drop_in_the_box']:
+            data = np.full((len(l3['ygrid']),len(l3['xgrid'])),np.nan)
+            for iy,y in enumerate(l3['ygrid']):
+                ymask = (self['ygrid']>=y-l3.grid_size/2) & (self['ygrid']<y+l3.grid_size/2)
+                for ix,x in enumerate(l3['xgrid']):
+                    xmask = (self['xgrid']>=x-l3.grid_size/2) & (self['xgrid']<x+l3.grid_size/2)
+                    if np.sum(ymask) == 0 and np.sum(xmask) == 0:
+                        continue
+                    data[iy,ix] = np.nanmean(nc['data'][np.ix_(ymask,xmask)])
+            landmask = data
+
+        self['landmask'] = landmask
+        return self
+
+
+    
     def regrid(self,l3,fields_to_copy=None,method=None):
         '''regrid inventory to match the mesh of a l3 data object
         fields_to_copy:
@@ -165,16 +202,19 @@ class Inventory(dict):
                 inv[field] = l3[field].copy()
             else:
                 self.logger.warning(f'{field} does not exist in l3!')
+        inv['landmask'] = self['landmask']
         return inv
     
     def get_mask(self,max_emission=1e-9,include_nan=True,
                  min_windtopo=None,max_windtopo=None,
                  min_surface_altitude=None,max_surface_altitude=None,
-                 min_column_amount=None,max_column_amount=None):
+                 min_column_amount=None,max_column_amount=None,
+                 min_wind_column=None,max_wind_column=None):# zitong add threshold for wind_column
         '''get a mask based on self['data']. pixels lower than max_emission will be True.
         nan will alse be True if include_nan
         '''
         mask = self['data'] <= max_emission
+        mask = mask & (self['landmask'] == 1)
         if include_nan:
             mask = mask | np.isnan(self['data'])
         if min_windtopo is not None:
@@ -191,6 +231,11 @@ class Inventory(dict):
             mask = mask & (self['column_amount'] > min_column_amount)
         if max_column_amount is not None:
             mask = mask & (self['column_amount'] <= max_column_amount)
+        if min_wind_column is not None:
+            mask = mask & (self['wind_column'] > min_wind_column)
+        if max_wind_column is not None:
+            mask = mask & (self['wind_column'] <= max_wind_column)
+        
         return mask
     
     def plot(self,ax=None,scale='log',**kwargs):
@@ -264,7 +309,7 @@ class AgriRegion():
             self.north = north
             self.xys = [([west,west,east,east],[south,north,north,south])]     
     
-    def get_region_emission(self,dt_array=None,l3_path_pattern=None,l3s=None,
+    def  get_region_emission(self,dt_array=None,l3_path_pattern=None,l3s=None,
                             masking_kw=None,
                             fit_topo_kw=None,fit_chem_kw=None):
         '''handle ammonia emission for the region
@@ -308,6 +353,7 @@ class AgriRegion():
         fit_chem_kw = fit_chem_kw or {}
         # handle masks
         nei_dir = masking_kw.pop('nei_dir',None)
+        landmask_dir = masking_kw.pop('landmask_dir',None)
         monthly_filenames = masking_kw.pop('monthly_filenames',None)
         max_topo_emission = masking_kw.pop('max_topo_emission',1e-9)
         max_chem_emission = masking_kw.pop('max_chem_emission',max_topo_emission)
@@ -319,6 +365,10 @@ class AgriRegion():
         min_topo_column_amount = masking_kw.pop('min_topo_column_amount',-np.inf)
         max_chem_column_amount = masking_kw.pop('max_chem_column_amount',np.inf)
         min_chem_column_amount = masking_kw.pop('min_chem_column_amount',-np.inf)
+        max_topo_wind_column = masking_kw.pop('max_topo_wind_column',np.inf)
+        min_topo_wind_column = masking_kw.pop('min_topo_wind_column',-np.inf)
+        max_chem_wind_column = masking_kw.pop('max_chem_wind_column',np.inf)
+        min_chem_wind_column = masking_kw.pop('min_chem_wind_column',-np.inf)
         if nei_dir is None and monthly_filenames is None:
             self.logger.warning('no info provided about inventory, skipping')
             topo_mask = np.ones(self.l3all['num_samples'].shape,dtype=bool)
@@ -329,22 +379,30 @@ class AgriRegion():
                 ).read_NEI_ag(
                 monthly_filenames=monthly_filenames,
                 nei_dir=nei_dir,unit='mol/m2/s'
-                ).regrid(
-                    self.l3all,
-                    fields_to_copy=['column_amount',
-                                    'wind_topo','surface_altitude']
-                    )
+                ).read_regrid_landmask(
+                    self.l3all,landmask_dir=landmask_dir
+                    ).regrid(
+                        self.l3all,
+                        fields_to_copy=['column_amount',
+                                        'wind_topo','surface_altitude',
+                                        'wind_column'] # zitong add
+                        )
             inventory_data = inv['data']
+            landmask_data = inv['landmask']
             topo_mask = inv.get_mask(max_emission=max_topo_emission,
                                      min_windtopo=min_topo_windtopo,
                                      max_windtopo=max_topo_windtopo,
                                      min_column_amount=min_topo_column_amount,
-                                     max_column_amount=max_topo_column_amount)
+                                     max_column_amount=max_topo_column_amount,
+                                     min_wind_column=min_topo_wind_column,
+                                     max_wind_column=max_topo_wind_column)
             chem_mask = inv.get_mask(max_emission=max_chem_emission,
                                      min_windtopo=min_chem_windtopo,
                                      max_windtopo=max_chem_windtopo,
                                      min_column_amount=min_chem_column_amount,
-                                     max_column_amount=max_chem_column_amount)
+                                     max_column_amount=max_chem_column_amount,
+                                     min_wind_column=min_chem_wind_column,
+                                     max_wind_column=max_chem_wind_column)
         if 'mask' in fit_topo_kw.keys():
             topo_mask = topo_mask & fit_topo_kw['mask']
         if 'mask' in fit_chem_kw.keys():
@@ -359,6 +417,7 @@ class AgriRegion():
         self.l3all['topo_mask'] = topo_mask
         self.l3all['chem_mask'] = chem_mask
         self.l3all[inv.name] = inventory_data
+        self.l3all['landmask'] = landmask_data
     
     def process_by_region(self,l3_path_pattern,topo_kw=None,chem_kw=None,
                  region_shpfilename=None, region_num=None):
@@ -409,7 +468,7 @@ class AgriRegion():
                 self.get_l3(l3_path_pattern=l3_path_pattern,topo_kw=topo_kw,chem_kw=chem_kw, region_xy=region_xy)
                 topo_scale_heights[region_names[i]] = self.l3ms.df['topo_scale_height']
                 chem_lifetimes[region_names[i]] = self.l3ms.df['chem_lifetime']
-                wind_column_topo = wind_column_topo + self.l3ms.df['wind_column_topo']*3600
+                wind_column_topo = wind_column_topo + self.l3ms.df['wind_column_topo']
 
         self.topo_scale_heights = topo_scale_heights
         self.chem_lifetimes = chem_lifetimes     
@@ -419,16 +478,12 @@ class AgriRegion():
             month = l3.start_python_datetime.strftime('%Y-%m')
             sh = self.topo_scale_heights[month]
             cl = self.chem_lifetimes[month]
-            wc_topo = l3['wind_column'] + l3['wind_topo']/sh
+            wc_topo = l3['wind_column']-sh*l3['wind_topo']
             l3['wind_column_topo'] = wc_topo*self.region_mask
-            wc_chem = l3['wind_column_topo'] + l3['column_amount']/cl/3600
+            wc_chem = l3['wind_column_topo']-cl*l3['column_amount']
             l3['wind_column_topo_chem'] = wc_chem*self.region_mask
             l3['month'] = month
             l3['date'] = l3.start_python_datetime
-            l3['wind_column'] = l3['wind_column']*self.region_mask
-            l3['column_amount'] = l3['column_amount']*self.region_mask
-            l3['topo'] = l3['wind_column_topo'] - l3['wind_column']
-            l3['chem'] = l3['wind_column_topo_chem'] - l3['wind_column_topo']
         
         l3ds_df = pd.DataFrame(self.l3ds)
         self.l3ds_df = l3ds_df
@@ -497,7 +552,7 @@ class AgriRegion():
 
             # create topo mask
             min_windtopo = topo_kw.pop('min_windtopo',0.001)
-            max_windtopo = topo_kw.pop('max_windtopo',1)
+            max_windtopo = topo_kw.pop('max_windtopo',0.1)
             min_H = topo_kw.pop('min_H',0.1)
             max_H = topo_kw.pop('max_H',2000)
             max_wind_column = topo_kw.pop('max_wind_column',1e-9) #???????
@@ -512,8 +567,8 @@ class AgriRegion():
             else:
                 topo_kw['mask'] = topo_mask
 
+            topo_kw['region_mask'] = region_mask
             # l3ms,_ = l3ds.resample(rule=topo_kw['resample_rule']) # zitong edit
-            print(topo_kw)
             l3ms.fit_topography(**topo_kw)
             self.topo_mask = topo_mask
             fields_name.append('wind_column_topo')
@@ -521,18 +576,21 @@ class AgriRegion():
 
         if chem_kw is not None:
             max_windtopo = chem_kw.pop('max_windtopo',0.001)
-            min_column_amount = chem_kw.pop('min_column_amount',2.5e-9) # not sure
+            # print(np.nanmax(l3['column_amount'].reshape(-1, 1)))
+            # print(np.nanmin(l3['column_amount'].reshape(-1, 1)))
+            min_column_amount = chem_kw.pop('min_column_amount',2.5e-5) # not sure
             max_wind_column = chem_kw.pop('max_wind_column',1e-9) # not sure
 
-            chem_mask = E0_mask #&\
-            # (l3['column_amount']>=min_column_amount) &\
-            # (np.abs(l3['wind_topo']/l3['column_amount'])<=max_windtopo) &\
-            # (l3['wind_column']<=max_wind_column)
+            chem_mask = E0_mask &\
+            (l3['column_amount']>=min_column_amount) &\
+            (np.abs(l3['wind_topo']/l3['column_amount'])<=max_windtopo) &\
+            (l3['wind_column']<=max_wind_column)
             if 'mask' in chem_kw.keys():
                 chem_kw['mask'] = chem_kw['mask'] & chem_mask
             else:
                 chem_kw['mask'] = chem_mask
 
+            chem_kw['region_mask'] = region_mask
             # l3ms,_ = l3ds.resample(rule=topo_kw['resample_rule']) # zitong edit
             l3ms.fit_chemistry(**chem_kw)
             self.chem_mask = chem_mask
@@ -549,88 +607,3 @@ class AgriRegion():
         self.topo_mask = topo_mask
         self.region_mask = region_mask
 
-<<<<<<< HEAD
-# make the mask E~=0
-# shp_file = "/projects/bbkc/zitong/Data/tl_2019_us_county/tl_2019_us_state.shp"
-# gdf = gpd.read_file(shp_file)
-# excel_file = "/projects/bbkc/zitong/Data/county_ammonia_2020.xlsx"
-# df = pd.read_excel(excel_file)
-# merged_gdf = gdf.merge(df, left_on='NAME', right_on='County')
-# extracted_polygons = merged_gdf[merged_gdf['Emission2020'] <= 400]
-# mask_polygon = unary_union(extracted_polygons.geometry)        
-your_path = '/projects/bbkc/zitong/Data/NEI_gridded'
-monthly_filenames = [os.path.join(your_path,f) for f in os.listdir(your_path) if os.path.isfile(os.path.join(your_path, f))]
-nei = Inventory().read_NEI_ag(monthly_filenames)
-nei.create_mask_from_sum_NH3(minNH3th = 10)
-
-# NH3_emission
-l3_path_pattern= '/projects/bbkc/zitong/Data/IASINH3L3_flux01/CONUS_%Y_%m_%d.nc'  # flux004：flux_grid_size=0.04
-region_shp_file = "/projects/bbkc/zitong/Data/tl_2019_us_county/tl_2019_us_state.shp" ## process_by_region
-agri_region = Agri_region(geometry=nei['boundary_mask'],start_dt=dt.datetime(2019,9,23),end_dt=dt.datetime(2021,10,14),west=-128,east=-65,south=24,north=50)#, region_num = 7
-topo_kw = {'resample_rule': '1M','fit_chem':True}#????fit_chem not sure True or False
-chem_kw = {'resample_rule': '1M'}
-agri_region.process_by_region(l3_path_pattern,topo_kw=topo_kw,chem_kw=chem_kw,
-                  region_shpfilename = region_shp_file, region_num = 6)
-print(agri_region.topo_scale_heights)
-print(agri_region.chem_lifetimes)
-# l3.plot(plot_field='wind_column_topo_chem',saving_path='temp1.png')
-
-# Plot scale height and lifetime
-months = pd.period_range(start='2019-09', end='2021-10', freq='M')
-timestamps = months.to_timestamp()
-fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(10, 5))
-axes[0].plot(timestamps,agri_region.l3ms.df['topo_scale_height'],marker='.',markersize=10) 
-axes[0].set_ylabel('Scale height (m)')
-axes[1].plot(timestamps,agri_region.l3ms.df['chem_lifetime'],marker='.',markersize=10)
-axes[1].set_ylabel('Lifetime (h)')
-plt.tight_layout()
-plt.show()
-plt.savefig('Xtao_region6.png')
-
-# # Spatial plot # plot monthly total emission of year 2020
-df = agri_region.l3ds_df
-filtered_df = df[df['date'] == '2020-04-01']
-states_gdf = gpd.read_file(region_shp_file)
-
-key = 'topo'
-
-months = pd.period_range(start='2020-04', end='2020-04', freq='M')
-for month in months:    
-    t = df[df['month']==str(month)]
-    arrays = t[key].values[0:len(t[key])]
-    list = arrays.tolist()
-    t1 = np.nansum(list, axis=0)
-    t1 = np.where(t1 == 0, np.nan, t1)
-
-    # matrix = filtered_df['wind_column_topo_chem'].values[0]
-    xgrid = filtered_df['xgrid'].iloc[0]
-    ygrid = filtered_df['ygrid'].iloc[0]
-    kwargs = {}
-    kwargs['cmap'] = 'jet'
-    kwargs['alpha'] = 1.
-    kwargs['shrink'] = 0.75
-    kwargs['vmin'] = np.nanmin(t1)
-    kwargs['vmax'] = np.nanmax(t1)
-    
-    fig,ax = plt.subplots(1,1,figsize=(10,5),subplot_kw={"projection": ccrs.PlateCarree()})
-    ax.set_extent([min(filtered_df['xgrid'].iloc[0]), max(filtered_df['xgrid'].iloc[0]), min(filtered_df['ygrid'].iloc[0]), max(filtered_df['ygrid'].iloc[0])], ccrs.Geodetic())
-    ax.coastlines(resolution='50m', color='black', linewidth=1)
-    ax.add_feature(cfeature.BORDERS.with_scale('50m'))
-    # ax.add_feature(cfeature.STATES.with_scale('50m'),edgecolor='k',linewidth=1)
-
-    pc = ax.pcolormesh(*F_center2edge(xgrid,ygrid),t1,transform=ccrs.PlateCarree(),
-                               alpha=kwargs['alpha'],cmap=kwargs['cmap'],vmin=-8e-7,vmax=8e-7)# kwargs['vmin'] kwargs['vmax']
-    cb = plt.colorbar(pc,ax=ax,label=key,shrink=kwargs['shrink'])
-    plt.xlim(-98,-78)
-    plt.ylim(35,45)
-    plt.text(min(filtered_df['xgrid'].iloc[0])+1,min(filtered_df['ygrid'].iloc[0])+1,str(month))
-    states_gdf.plot(ax=ax, edgecolor='black', facecolor='none', linewidth=1)
-    savepath = '/projects/bbkc/zitong/Data/Figure/{}_month_{}222.png'.format(key,month.strftime('%Y_%m'))
-    plt.savefig(savepath)
-    plt.close(fig)
-
-
-
-
-=======
->>>>>>> test_KS
