@@ -1,3 +1,7 @@
+"""
+Get ammonia emissions from Level3 data for a region
+"""
+
 import pandas as pd
 import os,sys,glob
 import logging
@@ -369,6 +373,7 @@ class AgriRegion():
                 max_topo_emission: inventory emission threshold for chem fit
                 {min,max}_{topo,chem}_{windtopo,column_amount}: min/max bounds for
                 windtopo and column_amount in the aggregated l3 for topo or chem fits
+                landmask_filename: file path of landmask (netcdf file)
         fit_topo/chem_kw:
             kw args for topo/chem fitting
         field:
@@ -389,7 +394,7 @@ class AgriRegion():
                               south=self.south,north=self.north)
             l3s.read_nc_pattern(l3_path_pattern=l3_path_pattern,
                                 fields_name=['column_amount','wind_column',
-                                             'num_samples','wind_topo','surface_altitude','wind_column_xy','wind_column_rs','skt'])
+                                             'num_samples','wind_topo','surface_altitude','wind_column_xy','wind_column_rs']) #,'skt'
         else:
             l3s = l3s.trim(west=self.west,east=self.east,south=self.south,north=self.north)
         self.l3all = l3s.aggregate()
@@ -433,7 +438,7 @@ class AgriRegion():
                         self.l3all,
                         fields_to_copy=['column_amount',
                                         'wind_topo','surface_altitude',
-                                        'wind_column','skt'] # zitong add
+                                        'wind_column'] # zitong add 'skt'
                         )
             inventory_data = inv['data']
             landmask_data = inv['landmask']
@@ -468,3 +473,52 @@ class AgriRegion():
         self.l3all[inv.name] = inventory_data
         self.l3all['landmask'] = landmask_data   
         self.l3all['nei_month'] = inv['NH3']    
+
+
+#### example usage
+import sys,os,glob
+sys.path.append('/projects/bbkc/zitong/Oversampling_matlab')
+from popy import Level3_List
+sys.path.append('/projects/bbkc/zitong/IDS/IDS.py')
+from IDS import AgriRegion
+import pandas as pd
+import numpy as np
+import datetime as dt
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs 
+import cartopy.feature as cfeature
+from IDS import Inventory
+
+start_dt = dt.datetime(2008,1,1)
+end_dt = dt.datetime(2022,12,31)
+dt_array = pd.period_range(start_dt,end_dt,freq='1D')
+
+west,east,south,north = -125,-67,25.1,49 # CONUS
+l3_path_pattern= '/projects/bbkc/zitong/Data/IASINH3L3_flux01/CONUS_%Y_%m_%d.nc' 
+nei_dir = '/projects/bbkc/zitong/Data/NEI_gridded'
+landmask_filename = '/projects/bbkc/zitong/Data/NLDAS_masks-veg-soil.nc4'
+mdwst = AgriRegion(start_dt=start_dt,end_dt=end_dt,
+                    west=west,east=east,south=south,north=north)
+# load emissions in the region
+mdwst.get_region_emission(l3_path_pattern=l3_path_pattern,
+                          field='NH3',l3_freq='1D',
+                          masking_kw=dict(            
+                              nei_dir=nei_dir,
+                              landmask_filename=landmask_filename,
+                              max_topo_emission=1e-9,
+                              max_chem_emission=1e-9,
+                              ),
+                          fit_topo_kw=dict(
+                              resample_rule='6M',
+                              max_iter=2,
+                              outlier_std=2, # zitong add
+                              min_windtopo=-np.inf,
+                              max_windtopo=np.inf,
+                              ),
+                          fit_chem_kw=dict(
+                              resample_rule='3M',
+                              max_iter=2,
+                              outlier_std=2, # zitong add
+                              min_windtopo=-np.inf,
+                              max_windtopo=np.inf,
+                              max_wind_column=np.inf))
